@@ -115,3 +115,24 @@ jobs:
           cd starter/backend/k8s
           kustomize edit set image backend=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
           kustomize build | kubectl apply -f -
+
+      - name: Wait for backend rollout
+        run: kubectl rollout status deployment/backend --timeout=180s
+
+      - name: Verify deployed movies API
+        run: |
+          for attempt in $(seq 1 120); do
+            address=$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -z "$address" ]; then
+              address=$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            fi
+            if [ -n "$address" ]; then
+              echo "Backend API: http://$address/movies"
+              curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 "http://$address/movies"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Timed out waiting for the backend LoadBalancer address."
+          kubectl get service backend -o wide
+          exit 1

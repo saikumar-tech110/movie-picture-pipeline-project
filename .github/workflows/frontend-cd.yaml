@@ -76,9 +76,26 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
+        env:
+          MOVIE_API_URL: ${{ secrets.MOVIE_API_URL }}
         run: |
+          if [ -z "$MOVIE_API_URL" ]; then
+            echo "::error::Set the MOVIE_API_URL repository secret to the public backend URL."
+            exit 1
+          fi
+          case "$MOVIE_API_URL" in
+            http://*|https://*) ;;
+            *) echo "::error::MOVIE_API_URL must start with http:// or https://."; exit 1 ;;
+          esac
+          case "$MOVIE_API_URL" in
+            *localhost*|*127.0.0.1*)
+              echo "::error::MOVIE_API_URL must be reachable outside this runner, not localhost."
+              exit 1
+              ;;
+          esac
+          MOVIE_API_URL="${MOVIE_API_URL%/}"
           docker build \
-            --build-arg REACT_APP_MOVIE_API_URL=http://localhost:5000 \
+            --build-arg REACT_APP_MOVIE_API_URL="$MOVIE_API_URL" \
             -t ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
             starter/frontend
 
@@ -117,3 +134,24 @@ jobs:
           cd starter/frontend/k8s
           kustomize edit set image frontend=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
           kustomize build | kubectl apply -f -
+
+      - name: Wait for frontend rollout
+        run: kubectl rollout status deployment/frontend --timeout=180s
+
+      - name: Wait for frontend address
+        run: |
+          for attempt in $(seq 1 120); do
+            address=$(kubectl get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -z "$address" ]; then
+              address=$(kubectl get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            fi
+            if [ -n "$address" ]; then
+              echo "Frontend URL: http://$address"
+              curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 "http://$address/"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Timed out waiting for the frontend LoadBalancer address."
+          kubectl get service frontend -o wide
+          exit 1
