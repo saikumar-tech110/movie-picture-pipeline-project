@@ -60,6 +60,7 @@ jobs:
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       ECR_REPOSITORY: frontend
+      EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -71,31 +72,39 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Resolve backend API URL
+        id: backend-api
+        run: |
+          for attempt in $(seq 1 120); do
+            address=$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -z "$address" ]; then
+              address=$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            fi
+            if [ -n "$address" ]; then
+              echo "url=http://$address" >> "$GITHUB_OUTPUT"
+              echo "Using backend API at http://$address/movies"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Timed out waiting for the backend LoadBalancer address."
+          kubectl get service backend -o wide || true
+          exit 1
+
       - name: Login to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
-        env:
-          MOVIE_API_URL: ${{ secrets.MOVIE_API_URL }}
         run: |
-          if [ -z "$MOVIE_API_URL" ]; then
-            echo "::error::Set the MOVIE_API_URL repository secret to the public backend URL."
-            exit 1
-          fi
-          case "$MOVIE_API_URL" in
-            http://*|https://*) ;;
-            *) echo "::error::MOVIE_API_URL must start with http:// or https://."; exit 1 ;;
-          esac
-          case "$MOVIE_API_URL" in
-            *localhost*|*127.0.0.1*)
-              echo "::error::MOVIE_API_URL must be reachable outside this runner, not localhost."
-              exit 1
-              ;;
-          esac
-          MOVIE_API_URL="${MOVIE_API_URL%/}"
           docker build \
-            --build-arg REACT_APP_MOVIE_API_URL="$MOVIE_API_URL" \
+            --build-arg REACT_APP_MOVIE_API_URL=${{ steps.backend-api.outputs.url }} \
             -t ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
             starter/frontend
 
@@ -129,10 +138,14 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
+      - name: Get AWS account ID
+        id: aws-account
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
       - name: Deploy frontend to Kubernetes
         run: |
           cd starter/frontend/k8s
-          kustomize edit set image frontend=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          kustomize edit set image frontend=${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
           kustomize build | kubectl apply -f -
 
       - name: Wait for frontend rollout
